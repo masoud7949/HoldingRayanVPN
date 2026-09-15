@@ -36,16 +36,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.vauth.foxyvpn.data.FxaAuthRepository
 import com.vauth.foxyvpn.data.GUARDIAN_ENDPOINT_DEFAULT
 import com.vauth.foxyvpn.data.GuardianClient
-import com.vauth.foxyvpn.data.TokenStore
 import com.vauth.foxyvpn.data.formatBytes
 import com.vauth.foxyvpn.data.model.Entitlement
 import kotlinx.coroutines.launch
 
 @Composable
 fun AccountScreen(
-    tokenStore: TokenStore,
+    authRepository: FxaAuthRepository,
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -55,15 +55,15 @@ fun AccountScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
     fun refresh() {
-        val accessToken = tokenStore.loadAuth()?.accessToken
-        if (accessToken == null) {
-            isLoading = false
-            errorMessage = "Not signed in."
-            return
-        }
         isLoading = true
         errorMessage = null
         scope.launch {
+            val accessToken = authRepository.currentAccessToken()
+            if (accessToken == null) {
+                isLoading = false
+                errorMessage = "Not signed in."
+                return@launch
+            }
             runCatching { GuardianClient().fetchUserInfo(GUARDIAN_ENDPOINT_DEFAULT, accessToken) }
                 .onSuccess { entitlement = it }
                 .onFailure { errorMessage = it.message ?: "Failed to load account info" }

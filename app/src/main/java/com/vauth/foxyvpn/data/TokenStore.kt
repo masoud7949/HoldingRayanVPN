@@ -5,6 +5,8 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.vauth.foxyvpn.data.model.RuntimeAuth
 
+private const val TAG = "TokenStore"
+
 class TokenStore(context: Context) {
 
     private val masterKey = MasterKey.Builder(context)
@@ -27,18 +29,31 @@ class TokenStore(context: Context) {
             .apply()
     }
 
-    fun loadAuth(): RuntimeAuth? {
-        val access = prefs.getString(KEY_ACCESS_TOKEN, null) ?: return null
+    fun loadAuth(): RuntimeAuth? = runCatching {
+        val access = prefs.getString(KEY_ACCESS_TOKEN, null)?.takeIf { it.isNotBlank() } ?: return@runCatching null
+        val refresh = prefs.getString(KEY_REFRESH_TOKEN, null)?.takeIf { it.isNotBlank() }
         val expiresAt = prefs.getLong(KEY_EXPIRES_AT, 0L)
-        return RuntimeAuth(access, prefs.getString(KEY_REFRESH_TOKEN, null), expiresAt)
-    }
+        RuntimeAuth(access, refresh, expiresAt)
+    }.onFailure {
+        AppLogger.w(TAG, "could not read the stored session", it)
+    }.getOrNull()
 
-    fun hasValidSession(): Boolean {
+    fun hasValidAccessToken(): Boolean {
         val auth = loadAuth() ?: return false
+        if (auth.expiresAtEpochSeconds <= 0L) return false
         val nowSeconds = System.currentTimeMillis() / 1000
-
         return auth.expiresAtEpochSeconds - nowSeconds > CLOCK_SKEW_TOLERANCE_SECONDS
     }
+
+    fun hasStoredSession(): Boolean = loadAuth() != null
+
+    fun hasRefreshToken(): Boolean = loadAuth()?.refreshToken != null
+
+    @Deprecated(
+        "Checks only access-token freshness; prefer hasValidAccessToken() or FxaAuthRepository.restoreSession().",
+        ReplaceWith("hasValidAccessToken()"),
+    )
+    fun hasValidSession(): Boolean = hasValidAccessToken()
 
     fun clear() {
         prefs.edit().clear().apply()
@@ -48,6 +63,7 @@ class TokenStore(context: Context) {
         private const val KEY_ACCESS_TOKEN = "access_token"
         private const val KEY_REFRESH_TOKEN = "refresh_token"
         private const val KEY_EXPIRES_AT = "expires_at"
-        private const val CLOCK_SKEW_TOLERANCE_SECONDS = 30L
+
+        private const val CLOCK_SKEW_TOLERANCE_SECONDS = 60L
     }
 }

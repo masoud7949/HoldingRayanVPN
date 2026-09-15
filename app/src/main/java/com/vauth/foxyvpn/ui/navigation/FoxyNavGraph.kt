@@ -36,7 +36,7 @@ fun FoxyNavGraph(
     NavHost(navController = navController, startDestination = FoxyRoutes.SPLASH) {
         composable(FoxyRoutes.SPLASH) {
             SplashScreen(
-                tokenStore = app.tokenStore,
+                authRepository = app.authRepository,
                 onSignedIn = {
                     navController.navigate(FoxyRoutes.HOME) { popUpTo(FoxyRoutes.SPLASH) { inclusive = true } }
                 },
@@ -86,7 +86,7 @@ fun FoxyNavGraph(
         }
         composable(FoxyRoutes.ACCOUNT) {
             AccountScreen(
-                tokenStore = app.tokenStore,
+                authRepository = app.authRepository,
                 onBack = { navController.popBackStack() },
             )
         }

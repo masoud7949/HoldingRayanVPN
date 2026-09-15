@@ -2,6 +2,7 @@ package com.vauth.foxyvpn.data
 
 import android.util.Base64
 import com.vauth.foxyvpn.data.model.RuntimeAuth
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl
@@ -17,9 +18,23 @@ import java.security.SecureRandom
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
+private const val TAG = "FxaAuthRepository"
+
 enum class LoginStep { CREDENTIALS, TWO_FACTOR }
 
+enum class SessionStatus {
+    ACTIVE,
+    NEEDS_LOGIN,
+    UNREACHABLE,
+}
+
 class FxaApiError(message: String, val errno: Int?, val statusCode: Int?) : Exception(message)
+
+class FxaRefreshFailure(
+    message: String,
+    val permanent: Boolean,
+    cause: Throwable? = null,
+) : Exception(message, cause)
 
 private const val FXA_AUTH_SERVER = "https://api.accounts.firefox.com/v1"
 private const val FIREFOX_CLIENT_ID = "5882386c6d801776"
@@ -31,6 +46,7 @@ private const val HKDF_LEN = 32
 private const val VERIFICATION_METHOD_EMAIL_2FA = "email-2fa"
 private const val FXA_ERRNO_INVALID_PARAMETER = 107
 private const val FXA_MAX_CHALLENGE_ATTEMPTS = 5
+private const val DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 24 * 60 * 60
 
 private val jsonMediaType = "application/json".toMediaType()
 
@@ -60,9 +76,45 @@ class FxaAuthRepository(
         false
     }
 
-    suspend fun refreshAccessToken(): RuntimeAuth? {
-        val current = tokenStore.loadAuth() ?: return null
-        val refreshToken = current.refreshToken?.takeIf { it.isNotBlank() } ?: return null
+    suspend fun restoreSession(): SessionStatus {
+        val stored = runCatching { tokenStore.loadAuth() }.getOrNull()
+            ?: return SessionStatus.NEEDS_LOGIN
+        if (stored.refreshToken == null && !tokenStore.hasValidAccessToken()) {
+            runCatching { tokenStore.clear() }
+            return SessionStatus.NEEDS_LOGIN
+        }
+        if (tokenStore.hasValidAccessToken()) return SessionStatus.ACTIVE
+
+        return try {
+            ensureFreshAccessToken()
+            SessionStatus.ACTIVE
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: FxaRefreshFailure) {
+            if (failure.permanent) {
+                AppLogger.w(TAG, "FxA rejected the stored session; signing out", failure)
+                runCatching { tokenStore.clear() }
+                SessionStatus.NEEDS_LOGIN
+            } else {
+                AppLogger.w(TAG, "could not renew the session right now; staying signed in", failure)
+                SessionStatus.UNREACHABLE
+            }
+        } catch (unexpected: Exception) {
+            AppLogger.w(TAG, "unexpected error while restoring the session", unexpected)
+            SessionStatus.UNREACHABLE
+        }
+    }
+
+    suspend fun ensureFreshAccessToken(force: Boolean = false): RuntimeAuth {
+        val current = tokenStore.loadAuth()
+            ?: throw FxaRefreshFailure("Not signed in", permanent = true)
+        if (!force && tokenStore.hasValidAccessToken()) return current
+
+        val refreshToken = current.refreshToken
+            ?: throw FxaRefreshFailure(
+                "The stored session has no refresh token; sign in again.",
+                permanent = true,
+            )
 
         val body = JSONObject().apply {
             put("client_id", FIREFOX_CLIENT_ID)
@@ -70,19 +122,66 @@ class FxaAuthRepository(
             put("refresh_token", refreshToken)
             put("scope", OAUTH_SCOPE)
         }
-        val tokenData = fxaDo("POST", "/oauth/token", jsonBody = body)
 
-        val accessToken = tokenData.optString("access_token")
-        if (accessToken.isBlank()) return null
+        val tokenData = try {
+            fxaDo("POST", "/oauth/token", jsonBody = body)
+        } catch (rejected: FxaApiError) {
+            throw FxaRefreshFailure(
+                rejected.message ?: "FxA rejected the refresh token",
+                permanent = rejected.isPermanentRefreshRejection(),
+                cause = rejected,
+            )
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (transport: Exception) {
+            throw FxaRefreshFailure(
+                transport.message ?: "Could not reach the Firefox Accounts server",
+                permanent = false,
+                cause = transport,
+            )
+        }
 
-        val rotated = tokenData.optString("refresh_token", "").ifBlank { null }
+        val accessToken = tokenData.optString("access_token").takeIf { it.isNotBlank() }
+            ?: throw FxaRefreshFailure(
+                "FxA returned no access token for the refresh grant",
+                permanent = false,
+            )
+
         val renewed = RuntimeAuth(
             accessToken = accessToken,
-            refreshToken = rotated ?: refreshToken,
-            expiresAtEpochSeconds = System.currentTimeMillis() / 1000 + tokenData.optInt("expires_in", 0),
+            refreshToken = tokenData.optString("refresh_token", "").ifBlank { null } ?: refreshToken,
+            expiresAtEpochSeconds = expiryFrom(tokenData),
         )
-        tokenStore.saveAuth(renewed)
+        runCatching { tokenStore.saveAuth(renewed) }
+            .onFailure { AppLogger.w(TAG, "could not persist the renewed token", it) }
         return renewed
+    }
+
+    suspend fun currentAccessToken(): String? = try {
+        ensureFreshAccessToken().accessToken
+    } catch (cancellation: CancellationException) {
+        throw cancellation
+    } catch (failure: FxaRefreshFailure) {
+        if (failure.permanent) null else tokenStore.loadAuth()?.accessToken
+    }
+
+    suspend fun refreshAccessToken(): RuntimeAuth? = try {
+        ensureFreshAccessToken(force = true)
+    } catch (cancellation: CancellationException) {
+        throw cancellation
+    } catch (failure: FxaRefreshFailure) {
+        AppLogger.w(TAG, "access token renewal failed", failure)
+        null
+    }
+
+    private fun FxaApiError.isPermanentRefreshRejection(): Boolean {
+        return statusCode == 400 || statusCode == 401 || statusCode == 403
+    }
+
+    private fun expiryFrom(tokenData: JSONObject): Long {
+        val expiresIn = tokenData.optInt("expires_in", 0)
+            .takeIf { it > 0 } ?: DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+        return System.currentTimeMillis() / 1000 + expiresIn
     }
 
     private suspend fun completeLogin(sessionToken: String) {
@@ -90,8 +189,8 @@ class FxaAuthRepository(
         tokenStore.saveAuth(
             RuntimeAuth(
                 accessToken = tokenData.getString("access_token"),
-                refreshToken = tokenData.optString("refresh_token", "").ifEmpty { null },
-                expiresAtEpochSeconds = System.currentTimeMillis() / 1000 + tokenData.optInt("expires_in", 0),
+                refreshToken = tokenData.optString("refresh_token", "").ifBlank { null },
+                expiresAtEpochSeconds = expiryFrom(tokenData),
             ),
         )
         pendingSessionToken = null

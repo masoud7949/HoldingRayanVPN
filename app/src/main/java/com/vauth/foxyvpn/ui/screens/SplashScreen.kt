@@ -4,8 +4,10 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -15,18 +17,30 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.vauth.foxyvpn.data.TokenStore
+import com.vauth.foxyvpn.data.FxaAuthRepository
+import com.vauth.foxyvpn.data.SessionStatus
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
+
+private const val SESSION_RESTORE_TIMEOUT_MS = 8_000L
 
 @Composable
 fun SplashScreen(
-    tokenStore: TokenStore,
+    authRepository: FxaAuthRepository,
     onSignedIn: () -> Unit,
     onNeedsLogin: () -> Unit,
 ) {
     LaunchedEffect(Unit) {
         delay(500)
-        if (tokenStore.hasValidSession()) onSignedIn() else onNeedsLogin()
+        val status = withTimeoutOrNull(SESSION_RESTORE_TIMEOUT_MS) {
+            authRepository.restoreSession()
+        } ?: SessionStatus.UNREACHABLE
+
+        when (status) {
+            SessionStatus.ACTIVE -> onSignedIn()
+            SessionStatus.UNREACHABLE -> onSignedIn()
+            SessionStatus.NEEDS_LOGIN -> onNeedsLogin()
+        }
     }
 
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -38,6 +52,13 @@ fun SplashScreen(
                 tint = MaterialTheme.colorScheme.primary,
             )
             Text("FoxyVPN", fontSize = 28.sp, color = MaterialTheme.colorScheme.onSurface)
+            CircularProgressIndicator(
+                modifier = Modifier
+                    .padding(top = 24.dp)
+                    .size(24.dp),
+                strokeWidth = 2.dp,
+                color = MaterialTheme.colorScheme.primary,
+            )
         }
     }
 }
