@@ -19,7 +19,7 @@
         android:name=".FoxyVpnApp"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
-        android:label="HoldingRayanVPN"
+        android:label="@string/app_name"
         android:theme="@style/Theme.FoxyVpn"
         android:supportsRtl="true">
 
